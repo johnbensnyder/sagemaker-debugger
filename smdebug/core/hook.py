@@ -62,10 +62,19 @@ except ImportError:
 
 logger = get_logger()
 
-
-class ScalarCache(object):
+class CacheRecord(object):
     def __init__(
-        self, scalar_name, scalar_val, mode, sm_metric, write_tb, write_event, timestamp=None
+        self, 
+        name, 
+        val, 
+        mode, 
+        sm_metric, 
+        write_tb, 
+        write_event, 
+        timestamp=None, 
+        mode_step=None, 
+        global_step=None,
+        record_type=None,
     ):
         """
 
@@ -77,16 +86,20 @@ class ScalarCache(object):
             write_tb: True or False indicates whether scalar will be written to Tensorboard
             write_event: True or False indicates whether scalar will be writen to event file.
             timestamp: Timestamp at which this object is created.
+            step: Step number, if none uses mode step from hook.
         The 'save_scalar()' method creates objects of this class and caches the scalars that users intends to store.
         These objects will be written to disk in the next available step.
         """
-        self.name = scalar_name
-        self.value = scalar_val
+        self.name = name
+        self.value = val
         self.mode = mode
         self.sm_metric = sm_metric
         self.write_tb = write_tb
         self.write_event = write_event
         self.timestamp = timestamp if timestamp else time.time()
+        self.mode_step = mode_step
+        self.global_step = global_step
+        self.record_type = record_type
 
 
 class BaseHook:
@@ -108,6 +121,7 @@ class BaseHook:
         include_collections: Optional[List[str]] = None,
         save_all: bool = False,
         include_workers: str = "one",
+        smp_state = None,
     ):
         """
         A class used to represent the hook which gets attached to the
@@ -232,6 +246,7 @@ class BaseHook:
         self.mode = ModeKeys.GLOBAL
         self.mode_steps = {ModeKeys.GLOBAL: init_step}
         self.writer = None
+        self.microbatch_step = 0
 
         self.profiler_config_parser = profiler_config_parser
         self.profiler_config_parser.load_config()
@@ -239,6 +254,11 @@ class BaseHook:
         self.timeline_writer = TimelineFileWriter(profiler_config_parser=profiler_config_parser)
         self.hvd_reader = None
         self.is_smdataparallel_profiling = False
+        
+        # Get SageMaker Model Parallel config if it exists
+        self.smp_state = smp_state
+        self.smp_module = None
+        self.smp_local_params = None
 
         if is_sagemaker_job() and SageMakerFileMetricsWriter is not None:
             self.metrics_writer = SageMakerFileMetricsWriter()
@@ -250,6 +270,9 @@ class BaseHook:
 
         # Cache scalars that are being saved through save_scalar() calls
         self.scalar_cache = []
+        
+        # Tensor cache for manually collected tensors
+        self.tensor_cache = []
 
         self.logger.info("Saving to {}".format(self.out_dir))
         atexit.register(self._cleanup)
@@ -569,8 +592,19 @@ class BaseHook:
         training_has_ended(self.out_dir)
         if self.first_process is True:
             remove_claim_file(self.out_dir)
+            
+    def _increment_microbatch(self):
+        # Update the microbatch state in the case of an SMP model
+        if not self.smp_state:
+            return True
+        self.microbatch_step += 1
+        if self.microbatch_step % self.smp_state.cfg.microbatches==0:
+            return True
+        return False
 
     def _increment_step(self):
+        if not self._increment_microbatch():
+            return
         # Update the last_state to the last step number that was saved or seen
         self._write_state()
 
@@ -782,7 +816,7 @@ class BaseHook:
             duration=duration,
             **kwargs,
         )
-
+            
     def _write_scalars(self):
         """
         This function writes all the scalar values saved in the scalar_cache to file.
@@ -802,27 +836,29 @@ class BaseHook:
             write_tb = scalar_obj.write_tb
             write_event = scalar_obj.write_event
             timestamp = scalar_obj.timestamp
+            mode_step = scalar_obj.mode_step if scalar_obj.mode_step is not None else self.mode_steps[scalar_mode]
+            global_step = scalar_obj.global_step if scalar_obj.global_step is not None else self.step
             if self.metrics_writer and sm_metric:
                 self.metrics_writer.log_metric(
                     scalar_name + "_" + scalar_mode.name,
                     scalar_val,
                     timestamp=timestamp,
-                    iteration_number=self.mode_steps[scalar_mode],
+                    iteration_number=mode_step,
                 )
             if write_tb:
                 tb_writer = self._maybe_get_tb_writer()
                 if tb_writer:
                     tb_writer.write_scalar_summary(
-                        scalar_name, scalar_val, self.step, timestamp=timestamp
+                        scalar_name, scalar_val, global_step, timestamp=timestamp
                     )
             if write_event:
                 self._initialize_writers(only_initialize_if_missing=True)
-                self._write_raw_tensor_simple(scalar_name, scalar_val, timestamp=timestamp)
+                self._write_raw_tensor_simple(scalar_name, scalar_val, timestamp=timestamp, step=mode_step)
 
         self.scalar_cache = []
 
     # Fix step number for saving scalar and tensor
-    def save_scalar(self, name, value, sm_metric=False, timestamp: float = None):
+    def save_scalar(self, name, value, sm_metric=False, timestamp: float = None, global_step: int = None, mode_step: int = None):
         """
         Call save_scalar at any point in the training script to log a scalar value,
         such as a metric or any other value.
@@ -833,10 +869,12 @@ class BaseHook:
         """
         name = CallbackHook.SCALAR_PREFIX + name
         val = self._make_numpy_array(value)
+        mode_step = mode_step if mode_step is not None else self.mode_steps[self.mode]
+        global_step = global_step if global_step is not None else self.step
         if val.size != 1:
             raise TypeError(f"{name} has non scalar value of type: {type(value)}")
-        scalar_obj = ScalarCache(
-            name, val, self.mode, sm_metric, write_tb=True, write_event=True, timestamp=timestamp
+        scalar_obj = CacheRecord(
+            name, val, self.mode, sm_metric, write_tb=True, write_event=True, timestamp=timestamp, mode_step=mode_step, global_step=global_step
         )
         self.scalar_cache.append(scalar_obj)
 
@@ -847,7 +885,7 @@ class BaseHook:
                 self._write_raw_tensor_simple(tensor_name, tensor_value, tensor_ref=tensor_ref)
                 break
 
-    def _write_shape(self, tensor_name, tensor_value, save_collections, tensor_ref=None):
+    def _write_shape(self, tensor_name, tensor_value, save_collections, tensor_ref=None, step=None):
         writers = self._get_writers(tensor_name, tensor_ref=tensor_ref)
         for s_col in save_collections:
             reduction_config = s_col.reduction_config
@@ -861,18 +899,19 @@ class BaseHook:
                     original_name = tensor_ref.tf_obj.name
                 else:
                     original_name = None
-
+                
+                step = step if step is not None else self.mode_steps[self.mode],
                 for writer in writers:
                     writer.write_shape(
                         tensor_name,
                         this_shape,
                         self.mode,
-                        self.mode_steps[self.mode],
+                        step, # self.mode_steps[self.mode],
                         original_name=original_name,
                     )
                 break
 
-    def _write_raw_tensor_simple(self, tensor_name, tensor_value, tensor_ref=None, timestamp=None):
+    def _write_raw_tensor_simple(self, tensor_name, tensor_value, tensor_ref=None, timestamp=None, step=None):
         # tensor_ref is used by TF
         # todo: if fp16, check perf of saving as fp16 in proto vs as fp32
         numpy_tensor_value = self._make_numpy_array(tensor_value)
@@ -884,7 +923,7 @@ class BaseHook:
                     tdata=numpy_tensor_value,
                     tname=tensor_name,
                     mode=self.mode,
-                    mode_step=self.mode_steps[self.mode],
+                    mode_step=step if step is not None else self.mode_steps[self.mode],
                     timestamp=timestamp,
                 )
 
@@ -923,13 +962,16 @@ class BaseHook:
                 np_val = self._make_numpy_array(tensor_value)
                 # Always log loss to SageMaker
                 tensor_val = np.mean(np_val)
-                scalar_obj = ScalarCache(
+                scalar_obj = CacheRecord(
                     tensor_name,
                     tensor_val,
                     self.mode,
                     sm_metric=True,
                     write_tb=False,
                     write_event=False,
+                    mode_step=self.mode_steps[self.mode],
+                    global_step=self.step
+                    
                 )
                 self.scalar_cache.append(scalar_obj)
 
@@ -959,7 +1001,7 @@ class BaseHook:
 
         # write histogram for this tensor if any collection this tensor
         # is part of has save_histogram as True
-        self._write_histogram_summary(tensor_name, tensor_value, save_collections)
+        # self._write_histogram_summary(tensor_name, tensor_value, save_collections)
 
         # write raw tensor if save_raw_tensor in reduction config is True
         self._write_raw_tensor(tensor_name, tensor_value, save_collections, tensor_ref=tensor_ref)
@@ -1031,6 +1073,7 @@ class CallbackHook(BaseHook):
         include_collections: Optional[List[str]] = None,
         save_all: bool = False,
         include_workers: str = "one",
+        smp_state = None,
     ):
         super().__init__(
             collection_manager=collection_manager,
@@ -1047,6 +1090,7 @@ class CallbackHook(BaseHook):
             save_all=save_all,
             include_workers=include_workers,
             profiler_config_parser=profiler_config_parser,
+            smp_state=smp_state,
         )
         self.exported_collections = False
         self.data_type_name = data_type_name
@@ -1060,7 +1104,6 @@ class CallbackHook(BaseHook):
     def _write(self, module_name, var, suffix, idx):
         if self.data_type_name is None:
             raise RuntimeError("This method can not be called when data_type is None")
-
         if var.__class__.__name__ == self.data_type_name:
             self._save_for_tensor(module_name + suffix + str(idx), var)
             return idx + 1

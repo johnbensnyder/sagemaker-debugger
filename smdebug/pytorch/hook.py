@@ -2,6 +2,7 @@
 import atexit
 import os
 import time
+from typing import Dict, List, Optional, Set, Union
 
 # Third Party
 import torch
@@ -33,7 +34,12 @@ if check_smdataparallel_env():
         import smdistributed.dataparallel.torch.distributed as smdataparallel
     except ImportError:
         pass
-
+try:
+    from smdistributed.modelparallel.torch.state_mod import state as smp_state
+    import smdistributed.modelparallel.torch as smp
+except ImportError:
+    smp_state = None
+    smp = None
 
 DEFAULT_INCLUDE_COLLECTIONS = [CollectionKeys.LOSSES]
 
@@ -93,6 +99,7 @@ class Hook(CallbackHook):
             include_collections=include_collections,
             save_all=save_all,
             include_workers=include_workers,
+            smp_state=smp_state,
         )
         # mapping of module objects to their names,
         # useful in forward hook for logging input/output of modules
@@ -122,7 +129,7 @@ class Hook(CallbackHook):
         )
         self.use_cuda = torch.cuda.is_available()
         atexit.register(self.profiler_config_parser.stop_post_hook_close_python_profiling)
-
+    
     def log_trace_event(self, event):
         self.record_trace_events(
             training_phase=event.training_phase,
@@ -311,7 +318,7 @@ class Hook(CallbackHook):
                     start_cpu_thread=event.thread,
                     cpu_thread_start_time=cpu_time,
                 )
-
+        
     # This hook is invoked by trainer prior to running the forward pass.
     @error_handling_agent.catch_smdebug_errors()
     def forward_pre_hook(self, module, inputs):
@@ -427,6 +434,29 @@ class Hook(CallbackHook):
         ), f"tensor_value={tensor_value} must be torch.Tensor"
 
         self._write_outputs(tensor_name, tensor_value)
+        
+    def _save_for_tensor(self, tensor_name, tensor_value, check_before_write=True):
+        """
+        Identifies if this tensor should be saved for this step
+        based on the save configs for the collections it belongs to.
+        If this tensor is to be saved, calls write_for_tensor.
+
+        This check can be disabled by passing check_before_write=False.
+        Disabling this check is cleaner for TF, as for TF this method is never
+        called if tensor should not be saved for this step.
+        :param tensor_name: str
+        The name of tensor. In TensorFlow's case, this is graph name of tensor
+        and will be converted to internal name in write_for_tensor.
+        :param tensor_value: dtype is tensor class of corresponding framework
+            value of the tensor to be saved
+        :param check_before_write: bool
+            checks whether to save tensor for this step
+        :return:
+        """
+        '''if not tensor_value.is_cuda:
+            return'''
+        
+        super()._save_for_tensor(tensor_name, tensor_value, check_before_write)
 
     # This hook is invoked by trainer after running the forward pass.
     @error_handling_agent.catch_smdebug_errors()
@@ -456,6 +486,8 @@ class Hook(CallbackHook):
         self.forward_modules_profile_stats.append(event)
         if len(self.forward_modules_profile_stats) == 1:
             self.first_forward_submodule_name = module._module_name
+        if not self.prepared_collections:
+            self._prepare_collections()
         if not self._get_collections_to_save_for_step():
             return
 
@@ -465,7 +497,7 @@ class Hook(CallbackHook):
 
         # Output input tensor
         self._write_inputs(module_name, inputs)
-
+        
         # Output output tensors
         self._write_outputs(module_name, outputs)
         self._save_custom_tensors_post_step()
@@ -561,8 +593,21 @@ class Hook(CallbackHook):
             total_params += param
         self.logger.info(f"Total Trainable Params: {total_params}")
         return total_params
+    
+    def _get_collections_with_tensor(self, tensor_name) -> Set["Collection"]:
+        self._assert_prep()
+        # override super class to check for SMP model first
+        if self.smp_state is not None:
+            if not self.smp_module._partitioned:
+                return set()
+            if self.smp_local_params is None:
+                self.smp_local_params = set(self.smp_module._local_parameters.keys())
+            if tensor_name.replace("DistributedModel_", "").replace("gradient/", "") \
+                not in self.smp_local_params and "grad" not in tensor_name.lower():
+                return set()
+        return super()._get_collections_with_tensor(tensor_name)
 
-    @error_handling_agent.catch_smdebug_errors()
+    #@error_handling_agent.catch_smdebug_errors()
     def register_module(self, module):
         """
         This function registers the forward hook. If user wants to register the hook
@@ -575,6 +620,8 @@ class Hook(CallbackHook):
             raise ValueError(
                 f"Module type {module.__class__.__name__} must be type torch.nn.Module"
             )
+        if smp and isinstance(module, smp.DistributedModel):
+            self.smp_module = module
         # in case GPU is available but model has been loaded on CPU
         for parameter in module.parameters():
             self.profiler = (
