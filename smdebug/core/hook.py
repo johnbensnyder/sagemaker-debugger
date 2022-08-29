@@ -615,21 +615,33 @@ class BaseHook:
             current_state[LATEST_MODE_STEP] = mode_step
             self.state_store.update_state(current_state)
 
-    def save_tensor(self, tensor_name, tensor_value, collections_to_write=CollectionKeys.DEFAULT):
+    def save_tensor(self, tensor_name, tensor_value, data_type=None, collections_to_write=CollectionKeys.DEFAULT, dataformats=None):
         if validate_custom_tensor_value(tensor_value, self._make_numpy_array) is False:
             self.logger.warn("The tensor value could not be converted into a numpy value")
             return
         if isinstance(collections_to_write, str):
             collections_to_write = [collections_to_write]
         for collection in collections_to_write:
-            self.custom_tensors_to_save[tensor_name] = (tensor_value, collection)
+            self.custom_tensors_to_save[tensor_name] = (tensor_value, collection, data_type, dataformats)
 
     def _save_custom_tensors_post_step(self):
         for tensor_name in self.custom_tensors_to_save:
-            tensor_value, collection_names = self.custom_tensors_to_save[tensor_name]
+            tensor_value, collection_names, data_type, dataformats = self.custom_tensors_to_save[tensor_name]
             c = self.collection_manager.get(collection_names, create=True)
             c.add_tensor_name(tensor_name)
             self._write_raw_tensor(tensor_name, tensor_value, [c])
+            '''
+            write to tensorboard output if requested
+            '''
+            #save_collections = self._get_collections_with_tensor(tensor_name)
+            save_collections = [self.collection_manager.get(CollectionKeys.DEFAULT)]
+            if data_type is not None:
+                if isinstance(data_type, str):
+                    data_type = [data_type]
+                if 'histogram' in data_type:
+                    self._write_histogram_summary(tensor_name, tensor_value, save_collections)
+                if 'image' in data_type:
+                    self._write_image_sumary(tensor_name, tensor_value, save_collections, dataformats)
         self.custom_tensors_to_save.clear()
 
     def set_mode(self, mode):
@@ -754,12 +766,22 @@ class BaseHook:
                     if self.dry_run or np_value.dtype == np.bool or np_value.nbytes == 0:
                         return
 
-                    hist_name = f"{s_col.name}/{tensor_name}"
+                    hist_name = f"hist/{s_col.name}/{tensor_name}"
                     self.logger.debug(f"Saving {hist_name} for global step {self.step}")
                     tb_writer.write_histogram_summary(
                         tdata=np_value, tname=hist_name, global_step=self.step
                     )
                     break
+                    
+    def _write_image_sumary(self, tensor_name, tensor_value, save_collections, dataformats='NCHW'):
+        tb_writer = self._maybe_get_tb_writer()
+        if tb_writer:
+            for s_col in save_collections:
+                np_value = self._make_numpy_array(tensor_value)
+                img_name = f"image/{s_col.name}/{tensor_name}"
+                self.logger.debug(f"Saving {img_name} for global step {self.step}")
+                tb_writer.write_image_summary(img_name, self._make_numpy_array(tensor_value), self.step, dataformats=dataformats)
+                break
 
     @error_handling_agent.catch_smdebug_errors()
     def record_trace_events(

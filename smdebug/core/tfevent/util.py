@@ -61,3 +61,53 @@ def make_tensor_proto(nparray_data, tag):
             sb = bytes(s, encoding="utf-8")
             tensor_proto.string_val.append(sb)
     return tensor_proto
+
+def make_grid(I, ncols=8):
+    # I: N1HW or N3HW
+    import numpy as np
+    assert isinstance(
+        I, np.ndarray), 'plugin error, should pass numpy array here'
+    if I.shape[1] == 1:
+        I = np.concatenate([I, I, I], 1)
+    assert I.ndim == 4 and I.shape[1] == 3 or I.shape[1] == 4
+    nimg = I.shape[0]
+    H = I.shape[2]
+    W = I.shape[3]
+    ncols = min(nimg, ncols)
+    nrows = int(np.ceil(float(nimg) / ncols))
+    canvas = np.zeros((I.shape[1], H * nrows, W * ncols), dtype=I.dtype)
+    i = 0
+    for y in range(nrows):
+        for x in range(ncols):
+            if i >= nimg:
+                break
+            canvas[:, y * H:(y + 1) * H, x * W:(x + 1) * W] = I[i]
+            i = i + 1
+    return canvas
+
+def convert_to_HWC(tensor, input_format):  # tensor: numpy array
+    import numpy as np
+    assert(len(set(input_format)) == len(input_format)), "You can not use the same dimension shordhand twice. \
+        input_format: {}".format(input_format)
+    assert(len(tensor.shape) == len(input_format)), "size of input tensor and input format are different. \
+        tensor shape: {}, input_format: {}".format(tensor.shape, input_format)
+    input_format = input_format.upper()
+
+    if len(input_format) == 4:
+        index = [input_format.find(c) for c in 'NCHW']
+        tensor_NCHW = tensor.transpose(index)
+        tensor_CHW = make_grid(tensor_NCHW)
+        return tensor_CHW.transpose(1, 2, 0)
+
+    if len(input_format) == 3:
+        index = [input_format.find(c) for c in 'HWC']
+        tensor_HWC = tensor.transpose(index)
+        if tensor_HWC.shape[2] == 1:
+            tensor_HWC = np.concatenate([tensor_HWC, tensor_HWC, tensor_HWC], 2)
+        return tensor_HWC
+
+    if len(input_format) == 2:
+        index = [input_format.find(c) for c in 'HW']
+        tensor = tensor.transpose(index)
+        tensor = np.stack([tensor, tensor, tensor], 2)
+        return tensor

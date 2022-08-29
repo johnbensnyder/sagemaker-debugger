@@ -30,6 +30,7 @@ from smdebug.core.tfevent.summary import (
     histogram_summary,
     make_numpy_array,
     scalar_summary,
+    image
 )
 from smdebug.core.tfevent.util import make_tensor_proto
 
@@ -178,6 +179,23 @@ class FileWriter:
 
     def write_summary(self, summ, global_step, timestamp: float = None):
         self.proto_writer.write_summary(summ, global_step, timestamp=timestamp)
+        
+    def write_image_summary(self, tdata, tname, global_step, dataformats='NCHW', boxes=None):
+        """Add image data to event file
+        Parameters
+        ----------
+        tname : str
+            Name for image.
+        tdata: `numpy.ndarray`
+            image data
+        global_step : int
+            Global step value to record.
+        dataformats : str
+            tensor format
+        boxes:
+            bounding boxes to apply to image
+        """
+        
 
     def write_histogram_summary(self, tdata, tname, global_step, bins="default"):
         """Add histogram data to the event file.
@@ -220,7 +238,11 @@ class FileWriter:
         self.index_writer.add_shape(
             TensorShape(name, mode.name, mode_step, shape, original_name=original_name)
         )
-
+        
+    def write_image_summary(self, tag, img_tensor, global_step, timestamp=None, dataformats='CHW'):
+        summary = image(tag, img_tensor, dataformats=dataformats)
+        self.write_summary(summary, global_step, timestamp)
+        
     def close(self):
         """Flushes the event file to disk and close the file.
         Call this method when you do not need the summary writer anymore.

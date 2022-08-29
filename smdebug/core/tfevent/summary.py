@@ -9,6 +9,7 @@ from smdebug.core.utils import make_numpy_array
 
 # Local
 from .proto.summary_pb2 import HistogramProto, Summary
+from .util import convert_to_HWC
 
 _INVALID_TAG_CHARACTERS = re.compile(r"[^-/\w\.]")
 
@@ -158,3 +159,125 @@ def histogram_summary(tag, values, bins, max_bins=None):
     values = make_numpy_array(values)
     hist = _make_histogram(values.astype(float), bins, max_bins)
     return Summary(value=[Summary.Value(tag=tag, histo=hist)])
+
+def _draw_single_box(image, xmin, ymin, xmax, ymax, display_str, color='black', color_text='black', thickness=2):
+    from PIL import ImageDraw, ImageFont
+    font = ImageFont.load_default()
+    draw = ImageDraw.Draw(image)
+    (left, right, top, bottom) = (xmin, xmax, ymin, ymax)
+    draw.line([(left, top), (left, bottom), (right, bottom),
+               (right, top), (left, top)], width=thickness, fill=color)
+    if display_str:
+        text_bottom = bottom
+        # Reverse list and print from bottom to top.
+        text_width, text_height = font.getsize(display_str)
+        margin = np.ceil(0.05 * text_height)
+        draw.rectangle(
+            [(left, text_bottom - text_height - 2 * margin),
+             (left + text_width, text_bottom)], fill=color
+        )
+        draw.text(
+            (left + margin, text_bottom - text_height - margin),
+            display_str, fill=color_text, font=font
+        )
+    return image
+
+def image(tag, tensor, rescale=1, rois=None, labels=None, dataformats='CHW'):
+    """Outputs a `Summary` protocol buffer with images.
+    The summary has up to `max_images` summary values containing images. The
+    images are built from `tensor` which must be 3-D with shape `[height, width,
+    channels]` and where `channels` can be:
+    *  1: `tensor` is interpreted as Grayscale.
+    *  3: `tensor` is interpreted as RGB.
+    *  4: `tensor` is interpreted as RGBA.
+    Args:
+      tag: A name for the generated node. Will also serve as a series name in
+        TensorBoard.
+      tensor: A 3-D `uint8` or `float32` `Tensor` of shape `[height, width,
+        channels]` where `channels` is 1, 3, or 4.
+        'tensor' can either have values in [0, 1] (float32) or [0, 255] (uint8).
+        The image() function will scale the image values to [0, 255] by applying
+        a scale factor of either 1 (uint8) or 255 (float32).
+    Returns:
+      A scalar `Tensor` of type `string`. The serialized `Summary` protocol
+      buffer.
+    """
+    tag = _clean_tag(tag)
+    tensor = make_numpy_array(tensor)
+    tensor = convert_to_HWC(tensor, dataformats)
+    # Do not assume that user passes in values in [0, 255], use data type to detect
+    if tensor.dtype != np.uint8:
+        tensor = (tensor * 255.0).astype(np.uint8)
+    image = make_image(tensor, rescale=rescale, rois=rois, labels=labels)
+    return Summary(value=[Summary.Value(tag=tag, image=image)])
+
+def image_boxes(tag, tensor_image, tensor_boxes, rescale=1, dataformats='CHW', labels=None):
+    '''Outputs a `Summary` protocol buffer with images.'''
+    tensor_image = make_numpy_array(tensor_image)
+    tensor_image = convert_to_HWC(tensor_image, dataformats)
+    tensor_boxes = make_numpy_array(tensor_boxes)
+
+    if tensor_image.dtype != np.uint8:
+        tensor_image = (tensor_image * 255.0).astype(np.uint8)
+
+    image = make_image(tensor_image,
+                       rescale=rescale,
+                       rois=tensor_boxes, labels=labels)
+    return Summary(value=[Summary.Value(tag=tag, image=image)])
+
+def _draw_single_box(image, xmin, ymin, xmax, ymax, display_str, color='black', color_text='black', thickness=2):
+    from PIL import ImageDraw, ImageFont
+    font = ImageFont.load_default()
+    draw = ImageDraw.Draw(image)
+    (left, right, top, bottom) = (xmin, xmax, ymin, ymax)
+    draw.line([(left, top), (left, bottom), (right, bottom),
+               (right, top), (left, top)], width=thickness, fill=color)
+    if display_str:
+        text_bottom = bottom
+        # Reverse list and print from bottom to top.
+        text_width, text_height = font.getsize(display_str)
+        margin = np.ceil(0.05 * text_height)
+        draw.rectangle(
+            [(left, text_bottom - text_height - 2 * margin),
+             (left + text_width, text_bottom)], fill=color
+        )
+        draw.text(
+            (left + margin, text_bottom - text_height - margin),
+            display_str, fill=color_text, font=font
+        )
+    return image
+
+def draw_boxes(disp_image, boxes, labels=None):
+    # xyxy format
+    num_boxes = boxes.shape[0]
+    list_gt = range(num_boxes)
+    for i in list_gt:
+        disp_image = _draw_single_box(disp_image,
+                                      boxes[i, 0],
+                                      boxes[i, 1],
+                                      boxes[i, 2],
+                                      boxes[i, 3],
+                                      display_str=None if labels is None else labels[i],
+                                      color='Red')
+    return disp_image
+
+
+def make_image(tensor, rescale=1, rois=None, labels=None):
+    """Convert an numpy representation image to Image protobuf"""
+    from PIL import Image
+    height, width, channel = tensor.shape
+    scaled_height = int(height * rescale)
+    scaled_width = int(width * rescale)
+    image = Image.fromarray(tensor)
+    if rois is not None:
+        image = draw_boxes(image, rois, labels=labels)
+    image = image.resize((scaled_width, scaled_height), Image.ANTIALIAS)
+    import io
+    output = io.BytesIO()
+    image.save(output, format='PNG')
+    image_string = output.getvalue()
+    output.close()
+    return Summary.Image(height=height,
+                         width=width,
+                         colorspace=channel,
+                         encoded_image_string=image_string)
