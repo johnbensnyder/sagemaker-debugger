@@ -981,7 +981,9 @@ class BaseHook:
 
         # write histogram for this tensor if any collection this tensor
         # is part of has save_histogram as True
-        self._write_histogram_summary(tensor_name, tensor_value, save_collections)
+        # disabled for now, extremely slow with large tensors. 
+        # DOTO: Figure out a better way to control when this runs
+        # self._write_histogram_summary(tensor_name, tensor_value, save_collections)
 
         # write raw tensor if save_raw_tensor in reduction config is True
         self._write_raw_tensor(tensor_name, tensor_value, save_collections, tensor_ref=tensor_ref)
