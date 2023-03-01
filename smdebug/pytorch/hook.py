@@ -643,6 +643,8 @@ class Hook(CallbackHook):
     @staticmethod
     def _make_numpy_array(tensor_value):
         if isinstance(tensor_value, torch.Tensor):
+            if tensor_value.dtype == torch.bfloat16:
+                tensor_value = tensor_value.to(torch.float32)
             return tensor_value.to(torch.device("cpu")).data.numpy()
         return make_numpy_array(tensor_value)
 
